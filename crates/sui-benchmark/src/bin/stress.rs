@@ -6,11 +6,22 @@ use futures::future::try_join_all;
 use futures::future::BoxFuture;
 use futures::FutureExt;
 use futures::{stream::FuturesUnordered, StreamExt};
+use prometheus::register_gauge_with_registry;
+use prometheus::register_histogram_with_registry;
+use prometheus::register_int_counter_with_registry;
+use prometheus::Gauge;
+use prometheus::Histogram;
+use prometheus::IntCounter;
+use prometheus::Registry;
 use sui_benchmark::workloads::workload::get_latest;
 use sui_benchmark::workloads::workload::WorkloadType;
 use sui_config::Config;
 use sui_config::PersistedConfig;
 use sui_core::authority_aggregator::AuthAggMetrics;
+use sui_core::authority_aggregator::AuthorityAggregator;
+use sui_gateway::config::GatewayConfig;
+use sui_node::metrics;
+use sui_node::SuiNode;
 use sui_types::base_types::ObjectID;
 use sui_types::base_types::SuiAddress;
 use tokio::sync::OnceCell;
@@ -27,10 +38,7 @@ use sui_benchmark::workloads::transfer_object::TransferObjectWorkload;
 use sui_benchmark::workloads::workload::CombinationWorkload;
 use sui_benchmark::workloads::workload::Payload;
 use sui_benchmark::workloads::workload::Workload;
-use sui_core::authority_aggregator::AuthorityAggregator;
 use sui_core::authority_client::NetworkAuthorityClient;
-use sui_gateway::config::GatewayConfig;
-use sui_node::SuiNode;
 use sui_quorum_driver::QuorumDriverHandler;
 use sui_sdk::crypto::SuiKeystore;
 use sui_types::crypto::EncodeDecodeBase64;
@@ -100,6 +108,10 @@ struct Opts {
     // Default workload is 100% transfer object
     #[clap(subcommand)]
     workload_spec: OptWorkloadSpec,
+    #[clap(long, default_value = "9091", global = true)]
+    pub server_metric_port: u16,
+    #[clap(long, default_value = "8081", global = true)]
+    pub client_metric_port: u16,
 }
 
 #[derive(Debug, Clone, Parser, Eq, PartialEq, EnumString)]
@@ -126,6 +138,51 @@ pub enum OptWorkloadSpec {
         #[clap(long, default_value = "1")]
         transfer_object: u32,
     },
+}
+
+pub struct BenchMetrics {
+    pub num_success: IntCounter,
+    pub num_error: IntCounter,
+    pub num_submitted: IntCounter,
+    pub num_in_flight: Gauge,
+    pub latency_s: Histogram,
+}
+
+impl BenchMetrics {
+    fn new(registry: &Registry) -> Self {
+        BenchMetrics {
+            num_success: register_int_counter_with_registry!(
+                "num_success",
+                "Total number of transaction success",
+                registry,
+            )
+            .unwrap(),
+            num_error: register_int_counter_with_registry!(
+                "num_error",
+                "Total number of transaction errors",
+                registry,
+            )
+            .unwrap(),
+            num_submitted: register_int_counter_with_registry!(
+                "num_submitted",
+                "Total number of transaction submitted to sui",
+                registry,
+            )
+            .unwrap(),
+            num_in_flight: register_gauge_with_registry!(
+                "num_in_flight",
+                "Total number of transaction in flight",
+                registry,
+            )
+            .unwrap(),
+            latency_s: register_histogram_with_registry!(
+                "latency_s",
+                "Total time in seconds to return a response",
+                registry,
+            )
+            .unwrap(),
+        }
+    }
 }
 
 struct Stats {
@@ -161,6 +218,7 @@ async fn run(
     num_requests_per_worker: u64,
     opts: Opts,
     barrier: Arc<Barrier>,
+    metrics: Arc<BenchMetrics>,
 ) {
     let mut tasks = Vec::new();
     let (tx, mut rx) = tokio::sync::mpsc::channel(100);
@@ -174,6 +232,7 @@ async fn run(
             .await;
         let tx_cloned = tx.clone();
         let cloned_barrier = barrier.clone();
+        let metrics_cloned = metrics.clone();
         // Make a per worker quorum driver, otherwise they all share the same task.
         let quorum_driver_handler = QuorumDriverHandler::new(clients.clone());
         let qd = quorum_driver_handler.clone_quorum_driver();
@@ -229,6 +288,8 @@ async fn run(
                         if let Some(b) = retry_queue.pop_front() {
                             num_submitted += 1;
                             num_error += 1;
+                            metrics_cloned.num_submitted.inc();
+                            metrics_cloned.num_error.inc();
                             let res = qd
                                 .execute_transaction(ExecuteTransactionRequest {
                                     transaction: b.0.clone(),
@@ -267,6 +328,8 @@ async fn run(
                         } else {
                             num_in_flight += 1;
                             num_submitted += 1;
+                            metrics_cloned.num_in_flight.inc();
+                            metrics_cloned.num_submitted.inc();
                             let payload = free_pool.pop().unwrap();
                             let tx = payload.make_transaction();
                             let start = Instant::now();
@@ -308,8 +371,11 @@ async fn run(
                             NextOp::Response(Some((start, payload))) => {
                                 free_pool.push(payload);
                                 let latency = start.elapsed();
+                                metrics_cloned.latency_s.observe(latency.as_secs_f64());
                                 num_success += 1;
                                 num_in_flight -= 1;
+                                metrics_cloned.num_success.inc();
+                                metrics_cloned.num_in_flight.dec();
                                 if latency > max_latency {
                                     max_latency = latency;
                                 }
@@ -441,9 +507,12 @@ async fn main() -> Result<()> {
         eprintln!("Configuring local benchmark..");
         let configs = {
             let mut configs = test_and_configure_authority_configs(opts.committee_size as usize);
+            let mut metric_port = opts.server_metric_port;
             configs.validator_configs.iter_mut().for_each(|config| {
                 let parameters = &mut config.consensus_config.as_mut().unwrap().narwhal_config;
                 parameters.batch_size = 12800;
+                config.metrics_address = format!("127.0.0.1:{}", metric_port).parse().unwrap();
+                metric_port += 1;
             });
             Arc::new(configs)
         };
@@ -549,17 +618,24 @@ async fn main() -> Result<()> {
         client_runtime.block_on(async move {
             let committee = gateway_config.make_committee().unwrap();
             let authority_clients = gateway_config.make_authority_clients();
-            let metrics = AuthAggMetrics::new(&prometheus::Registry::new());
+            let registry: Registry = metrics::start_prometheus_server(
+                format!("127.0.0.1:{}", opts.client_metric_port)
+                    .parse()
+                    .unwrap(),
+            );
+            let metrics = AuthAggMetrics::new(&registry);
             let aggregator = AuthorityAggregator::new(committee, authority_clients, metrics);
             let mut workload = make_workload(primary_gas_id, owner, keypair, &opts);
             workload.init(&aggregator).await;
             let barrier = Arc::new(Barrier::new(opts.num_workers as usize));
+            let metrics = Arc::new(BenchMetrics::new(&registry));
             run(
                 aggregator,
                 workload,
                 max_in_flight_ops as u64 / opts.num_workers,
                 opts,
                 barrier,
+                metrics,
             )
             .await
         });
