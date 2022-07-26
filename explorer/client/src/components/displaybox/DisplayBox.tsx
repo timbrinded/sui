@@ -26,6 +26,12 @@ function DisplayBox({
 
     const [hasClickedImage, setHasClickedImage] = useState(false);
 
+    const [fileType, setFileType] = useState('');
+
+    useEffect(() => {
+        extractFileType(display).then((result) => setFileType(result));
+    }, [display]);
+
     const imageStyle = hasDisplayLoaded ? {} : { display: 'none' };
     const handleImageLoad = useCallback(() => {
         setHasDisplayLoaded(true);
@@ -104,9 +110,7 @@ function DisplayBox({
                             {caption && (
                                 <div className={styles.caption}>{caption} </div>
                             )}
-                            <div className={styles.filetype}>
-                                {extractFileType(display)}
-                            </div>
+                            <div className={styles.filetype}>{fileType}</div>
                         </div>
                         <div className={styles.detailsbg} />
                     </div>
